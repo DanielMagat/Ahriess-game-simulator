@@ -44,7 +44,7 @@ The guiding principle throughout: **one shared, headless rules engine**, used lo
 3. Both gain \+1 max energy, refill current energy to max.  
 4. Start-of-turn triggers fire.  
 5. Each player gains \+1 influence in a color of their choice.  
-6. **Turn Priority** loop (see §6) — the main phase.  
+6. **Main Phase** loop (see §6) — the priority-and-actions phase.  
 7. End of turn: discard down to 2 cards in hand; end-of-turn triggers fire.
 
 ### Board layout
@@ -52,7 +52,7 @@ The guiding principle throughout: **one shared, headless rules engine**, used lo
 - 4 lanes. Each lane has: a Location card (assigned pre-game via a draft procedure, not part of either deck), a base health total per player (starts at 10), and each player's **attack sequence** — an ordered list of that player's units in the lane.  
 - New units are always appended to the **end** of their side's attack sequence in that lane, regardless of how they got there (played, summoned, or moved in from another lane).  
 - A lane is **deactivated** when a base reaches 0; no further combat occurs there.
-- **Adjacency**: the four lanes wrap around — lane 1 and lane 4 (leftmost and rightmost) are adjacent to each other, not just to their immediate neighbor. Relevant to any card that scopes an effect to "adjacent lanes."
+- **Adjacency**: the four lanes form a ring — lane 1 and lane 4 (leftmost and rightmost) are adjacent to each other, same as any other neighboring pair, not just to their immediate neighbor. This is dynamic, not just the static starting layout: a deactivated lane is effectively removed from the ring, and its two neighbors become adjacent to *each other* instead — e.g. if lane 3 deactivates, lane 2's only remaining neighbors become 1 and 4 (skipping straight over 3). A unit sitting *in* a deactivated lane still uses its own position to ask "what's adjacent to here" (it can still be moved out during Repositioning), even though the lane itself no longer counts as anyone else's neighbor. Once two lanes are deactivated, a unit in either one can reach *both* remaining active lanes — the same skip-over rule, just with a bigger gap. See `resolution/lanes.ts`'s `getEffectiveAdjacentLanes` for the implementation, confirmed against worked examples for one- and two-lane deactivation.
 
 ### Repositioning charges
 
@@ -60,6 +60,7 @@ The guiding principle throughout: **one shared, headless rules engine**, used lo
 - At the start of Repositioning (i.e., the moment combat is initiated), **both players'** charge pools are set to the current turn number — turn 3 grants 3 charges each, turn 10 grants 10, etc.
 - Moving a unit to another lane costs 1 charge by default. `Agile n` (§4 Keywords) lets a unit's first `n` moves that repositioning phase skip the charge cost entirely.
 - Charges are per-player, not per-unit — a player spends from one shared pool no matter which of their units they're moving.
+- The normal flow: the player selects a unit, the engine offers its *currently* legal destination lane(s) (adjacency, accounting for deactivated lanes — see below), the player picks one, and the engine validates and executes the move. The engine's `isLegalRepositionDestination` hook is where that validation lives — real integration should always back it with `getEffectiveAdjacentLanes`.
 
 ### Deckbuilding
 
@@ -150,6 +151,8 @@ Reuses the same `Ability[]` machinery as cards, but has no cost block and no mod
 
 Ability {
 
+  id?: string                                  // author-assigned, stable — needed for usage limits and Negate(thisAbilityOnly); omit if neither applies
+
   trigger: TriggerSpec
 
   condition?: ConditionExpr
@@ -158,9 +161,11 @@ Ability {
 
   action: Action\[\] | { hook: string }        // composable primitives, OR named escape hatch
 
+  usageLimit?: UsageLimit                      // none / oncePerTurn / oncePerGame / compound — see Usage limits below. Applies to ANY trigger kind, not just Activated.
+
 }
 
-`TriggerSpec` — confirmed trigger points: `EtB`, `Fall`, `SoT` (incl. specific-turn-number variants), `EoT`, priority-window "you may" effects, `StartOfCombat`, during Repositioning, during Trap Placement, end of Trap Placement (*before* the stack resolves — a distinct hook from the resolution itself), Trap resolves, `StartOfDamage`, a unit dealing/taking combat damage, `EndOfCombat`, `LaneDeactivated`, `Activated{cost, usageLimit}` (`usageLimit`: none / once-per-turn / once-per-game / compound), plus a `Custom` escape variant for anything that doesn't fit cleanly.
+`TriggerSpec` — confirmed trigger points: `EtB`, `Fall`, `SoT` (incl. specific-turn-number variants), `EoT`, priority-window "you may" effects, `StartOfCombat`, during Repositioning, during Trap Placement, end of Trap Placement (*before* the stack resolves — a distinct hook from the resolution itself), Trap resolves, `StartOfDamage`, a unit dealing/taking combat damage, `EndOfCombat`, `LaneDeactivated`, `Activated{cost}`, plus a `Custom` escape variant for anything that doesn't fit cleanly. (`usageLimit` used to be nested inside `Activated` — it's now `Ability.usageLimit`, applying uniformly to any trigger kind; see Usage limits below.)
 
 `TargetSpec` — **no card in the pool uses the word "target."** Selection is always descriptive/positional: lane scope (`this lane` / adjacent / other lanes / all lanes — `this lane` dominates overwhelmingly), allegiance (allied/enemy/each player's), sequence position (first/last-in-sequence — "first" dominates), quantity (single / each matching / any number chosen by the player), zone (hand/graveyard/deck-top-N), rarely random. See §7 for how selection interacts with queued (non-immediate) resolution.
 
@@ -169,14 +174,38 @@ Ability {
 | Category | Primitives |
 | :---- | :---- |
 | Damage/healing | `dealDamage`, `heal` |
-| Card/zone movement | `draw`, `discard`, `exile`, `sacrifice`, `destroy`, `returnToHand`, `search`, `moveUnit` (lane→lane, appends to end of new sequence), generic `moveZone` |
+| Card/zone movement | `draw`, `discard`, `exile`, `sacrifice`, `destroy`, `returnToHand`, `search`, `moveUnit`, generic `moveZone` — see below for how these fit together |
 | Counters/stats | `addCounter` / `removeCounter`, `buffStat` (permanent or `until X`), `massIncrement` (see Counters below) |
-| Board control | `freeze`, `negate` (see Keywords — one canonical mechanic, previously mis-split into three names) |
-| Cost/economy | `modifyCost` (often conditional, e.g. "1 less per Trap played"), `gainEnergy` (temporary vs. permanent-max), `gainInfluence`, `spendInfluence` |
+| Board control | `freeze`, `negate` (see Keywords and Negate below — one canonical mechanic, previously mis-split into three names) |
+| Cost/economy | `modifyCost` (often conditional, e.g. "1 less per Trap played" — **waiting on real card examples to implement correctly**, see §9), `gainEnergy` (temporary vs. permanent-max), `gainInfluence`, `spendInfluence` |
 | Meta-structural | `copy`, `fuse`, `switchForm`, `createToken`, `transform`, `changeCardType` (a handful of cards change a target's card type; bidirectional — `from`/`to` are each a list of `CardType`) |
 | Modal/choice | `chooseOne`, `chooseAnyNumber`, `lookAtTopN` \+ rearrange — these are **resolution-time decision points**, not upfront targeting (§7) |
 
 **Duration** (for temporary effects): `untilNextCombat`, `untilEoT`, `untilEndOfCombat`, `untilNextSoT`, `untilPhaseIn`, `untilCondition(expr)`, `permanent`.
+
+**Card/zone movement, worked out**: `moveZone` is the one general mechanism underneath all of it — move a card between two fully-addressed zone locations (`{kind: "hand"|"graveyard"|"deck"|"exile", playerId}`, or `{kind: "battlefield", playerId, laneId, mode?}`). Leaving the battlefield tears the object down (damage discarded, counters kept — the zone-change rule above); entering it creates a fresh one, commits a mode, and adds it to the destination lane's attack sequence and/or structures per its effective types. `discard`, `exile`, and `returnToHand` are the named, card-text-facing vocabulary for specific common cases of this — they delegate to the same mechanism rather than duplicating it, so a card just says "exile this," not "moveZone this to my exile." `search` (below) also produces a `moveZone` call once it's picked a card. The eventual "play a card from hand" is expected to be: pay costs, ask the player which lane, then `moveZone(card, hand, {battlefield, that lane, chosen mode})` — the same call, just from a different starting point. `moveUnit` is deliberately **not** part of this family: it's a same-battlefield, different-lane move (governed by adjacency and Repositioning charges, not by zone rules at all — see below), so it keeps its own mechanism.
+
+**`search`**: matches cards in a zone against criteria — currently `type` and/or `cost` (`eq`/`gt`/`lt` a number), ANDed when both given (e.g. "a unit that costs 5"). Designed to extend to more stats later (power, toughness, keyword...) as one more optional, ANDed field, without a redesign. Checks **both of a card's modes independently** and reports which specific mode(s) qualify — this matters because the two modes can differ in cost and type entirely. Going to hand moves the whole physical card, uncommitted (either mode still playable later, since hand doesn't fix a mode — see Card Data Model above). Going to the battlefield **commits to the specific matching mode** — a card whose mode A costs 1 and mode B costs 6, searched for "costs 1," enters as mode A only, never mode B, even though it's the same physical card. Picking among multiple matching cards, or among multiple qualifying modes of a single match headed to the battlefield, are both genuine player decisions (deck searches are browsed, not auto-picked) waiting on the decision-checkpoint mechanism, same as everything else that needs one; the deterministic cases (one match, one qualifying mode) work today. Defaults to searching the ability's own controller's zone — there's no way yet to search an opponent's zone if a future card needs that (§9).
+
+**`moveUnit`**: takes a concrete destination lane, not a scope to resolve — by the time this executes, "which lane" has already been decided, normally by the player picking one of the options `isLegalRepositionDestination` (backed by lane adjacency, below) currently allows. A card effect that moves a unit via its own Action list needs to have already resolved a concrete destination the same way.
+
+### Negate
+
+The one canonical name for ability/effect suppression (`Negate(scope, duration)` — "SuppressEffects" and "disableThisAbility" from earlier drafts were the same mechanic named inconsistently, not three mechanics), parameterized by scope:
+
+- `thisAbilityOnly`: silences exactly one ability on the target object, leaving its others fully functional. Needs `Ability.id` (§4, Ability/Trigger/Target/Action below) to know *which* one — this is why abilities got an id field at all: a card can have several abilities, and negating one must never touch the others (confirmed requirement — a once-per-turn limit on one ability, for instance, must not affect a different ability on the same card).
+- `allAbilitiesOfObject`: silences everything on the target, no id needed.
+- `allCardsMatchingName`: structurally different from the other two — it has to reach objects that don't exist yet when it resolves (a copy drawn later, a token created after the fact), so it can't be a per-object status effect the way the other two are. It lives as a global list on `MatchState` instead (`activeNameNegations`) rather than attached to any one object.
+
+Implemented at the type/data level (the `negated` StatusEffect for the first two scopes, the global list for the third) and as pure, tested checking logic (`resolution/abilityAvailability.ts`'s `isAbilityNegated`) — but nothing calls that logic yet, because nothing in the engine automatically fires triggered abilities in the first place (see the new Roadmap item below). The checking rule itself is settled; only its live wiring is still ahead.
+
+### Usage limits
+
+`UsageLimit` (`none | oncePerTurn | oncePerGame | { compound: UsageLimit[] }`) lives on `Ability` itself now, not nested inside the `Activated` trigger the way it was originally drafted — a plain triggered ability ("When \[condition\] is met, draw a card. Once per game.") needs the exact same limiting with no activation cost involved at all, so one general mechanism covers both rather than "usage limits, but only for the one trigger kind that happened to need it first."
+
+Tracked per-instance, per-ability-id, on `CardInstance.abilityUsage` — never on the (static, shared-by-every-copy) `Ability`/`ModeDefinition` data itself, since two copies of the same card (or the same physical card returning to the battlefield later) each need their own independent count, and a `oncePerGame` count needs to survive a zone change the same way counters do (the zone-change rule above). `oncePerTurn` resets implicitly by comparing against the current turn number rather than needing an explicit reset step. Pure logic (`isUsageAvailable`, `recordAbilityUsage`) lives in `resolution/abilityAvailability.ts`, tested including the specific "two abilities on one object track independently" case — same not-yet-wired status as Negate above, for the same reason (no trigger-dispatch loop yet).
+
+**Open**: what `{ compound: UsageLimit[] }` actually composes (twice per game? once per turn *and* once per game together?) is still undefined — see §9.
 
 ### Keywords — sugar over the Ability system, not a separate mechanism
 
@@ -202,7 +231,7 @@ Keyword \=
 
 **Deferred, not implemented**: an "Unlock" mechanic (pay a permanent's other mode's cost to grant it that mode's effects additionally) — too complex for its actual usage rate; revisit only if it comes back into active card design.
 
-**Negate** is the one canonical name for ability/effect suppression, parameterized by scope: `Negate(scope: thisAbilityOnly | allAbilitiesOfObject | allCardsMatchingName, duration)`. ("SuppressEffects" and "disableThisAbility" from earlier drafts were the same mechanic named inconsistently, not three mechanics.)
+**Negate** — see the dedicated Negate section above (implementation, scopes, and current status).
 
 ### Counters
 
@@ -222,7 +251,7 @@ MatchState {
 
   turnNumber, activePlayerId, attackTokenHolderId, attackTokenSpentThisTurn: bool
 
-  phase: TurnPriority | Repositioning | TrapPlacement | TrapResolution | Damage
+  phase: StartPhase | MainPhase | Repositioning | TrapPlacement | TrapResolution | Damage | EndPhase
 
   priorityPlayerId, consecutivePasses
 
@@ -248,7 +277,7 @@ PlayerState {
 
   influence: { E, S, I, B }
 
-  zones: { deck: CardId\[\], hand: CardId\[\], graveyard: CardId\[\] }
+  zones: { deck: CardId\[\], hand: CardId\[\], graveyard: CardId\[\], exile: CardId\[\] }
 
 }
 
@@ -282,13 +311,15 @@ BattlefieldUnit {
 
 Unlike MTG's convention of stripping nearly everything when an object changes zones, this game only resets **damage** on a zone change (battlefield → graveyard, hand → battlefield, etc.) — a card always enters a new zone undamaged. Its **counters persist across the change** and are never automatically stripped; they carry over with the object wherever it goes, including back onto the battlefield later if something returns it.
 
+**Exile is a real, fully accessible zone — not a "removed from the game" bucket.** It behaves exactly like deck/hand/graveyard: cards sit in it, can be counted, and can be moved out of it by an effect that says so. Some exile effects will still leave a card practically unreachable simply because no card ever references it again ("exile this unit" with no further text) — but that's a property of that specific card's design, not a limitation of the zone itself. Contrast effects like "exile this unit and return it at end of turn" or "this card's power equals the number of allied cards in exile," both of which need exile to be a normal, queryable zone to work at all.
+
 **Traps are global, not per-lane.** A trap is *set* to a specific lane — most of its effects are local to that lane — but all traps on the board resolve from one shared, board-wide LIFO stack, not four independent per-lane stacks. Concretely: if P1 sets a trap to lane 1, then P2 sets a trap to lane 4, P2's trap (set last) resolves first, even though it's a different lane — trap placement order across the whole board determines resolution order, lane assignment doesn't create separate queues.
 
 ## 6\. Phase State Machine
 
-A turn is **one continuous priority loop**, not separate pre/post-combat phases — combat is an action available within it, and play resumes in the same loop afterward until both players pass consecutively.
+A turn is **one continuous priority loop**, not separate pre/post-combat phases — combat is an action available within it, and play resumes in the same loop afterward until both players pass consecutively. This phase is called **Main Phase** in the code (renamed from an earlier "Turn Priority" for clarity — that name is retired; if you see it anywhere, it means "Main Phase").
 
-TURN\_PRIORITY:
+MAIN\_PHASE:
 
   legal actions: play card, activate ability,
 
@@ -298,35 +329,40 @@ TURN\_PRIORITY:
 
   → initiate combat → COMBAT\_REPOSITIONING → COMBAT\_TRAP\_PLACEMENT → COMBAT\_TRAP\_RESOLUTION
 
-    → COMBAT\_DAMAGE → back to TURN\_PRIORITY, priority to non-initiator, token marked spent
+    → COMBAT\_DAMAGE → back to MAIN\_PHASE, priority to non-initiator, token marked spent
 
   → double pass (only reachable once token is spent) → END\_OF\_TURN → next SoT
 
-`COMBAT_REPOSITIONING` and `COMBAT_TRAP_PLACEMENT` are structurally identical to `TURN_PRIORITY`: alternating action-or-pass, starting with whoever initiated combat, until both pass consecutively — just with a different legal-action set (spend a charge to move a unit; set a trap face down). This should be **one generic "alternating priority window" procedure**, parameterized by starting player and legal-action set, implemented once and reused three times rather than three separate implementations.
+`COMBAT_REPOSITIONING` and `COMBAT_TRAP_PLACEMENT` are structurally identical to `MAIN_PHASE`: alternating action-or-pass, starting with whoever initiated combat, until both pass consecutively — just with a different legal-action set (spend a charge to move a unit; set a trap face down). This should be **one generic "alternating priority window" procedure**, parameterized by starting player and legal-action set, implemented once and reused three times rather than three separate implementations.
 
 ## 7\. Resolution & Targeting Semantics
 
-There is no MTG-style stack of instants, but there **are** two places where an ability sits in a queue rather than resolving the instant it's declared: the **trap stack** (set during placement, resolves LIFO afterward) and the **simultaneous-trigger queue**. Anything can happen to the board between an ability being queued and it actually resolving — including a target dying, or a new object appearing that wasn't there when the ability was queued and should not retroactively qualify.
+There is no MTG-style stack of instants, but there **are** two places where an ability sits in a queue rather than resolving the instant it's declared: the **trap stack** (set during placement, resolves LIFO afterward, board-wide — §5) and the **simultaneous-trigger queue**. Anything can happen to the board between an ability being queued and it actually resolving — including a target dying, or a new object appearing that wasn't there when the ability was queued.
 
-The fix, adapted from how MTG's stack handles the same problem: **any ability that enters a queue snapshots its selection at the moment it's queued, not at the moment it resolves.**
+Two different rules apply depending on *how* the ability's targets were determined, because the risk each one guards against is different:
 
-- A player choice ("choose an enemy unit") is made **when the ability is queued**.  
-- An automatic scope ("each enemy unit here") is evaluated **once, at queue time**, into a fixed list of specific object references.  
-- At resolution, the engine re-validates each locked reference against the *original* selection criteria — existence, location, type/allegiance. Anything that no longer qualifies is dropped silently; the effect applies to whatever survives. Nothing gets re-selected to fill the gap.
+- **A player choice** ("choose an enemy unit," or "choose any number of...") is made **when the ability is queued**, and locked in. At resolution, the engine re-validates each locked reference against the *original* selection criteria — existence, location, type/allegiance. Anything that no longer qualifies is dropped silently; the effect applies to whatever survives. Nothing gets re-selected to fill the gap — a new object appearing in the meantime does not retroactively become something the player "chose."
+- **An automatic scope** ("each enemy unit here," no player agency in which ones) is the opposite: nothing is decided or locked at queue time at all. It's evaluated **fresh, live, at the moment of resolution** — whoever currently matches the scope gets hit, including anything that showed up after the ability was queued. There's nothing to snapshot against in the first place, since there was never a choice being protected.
 
-This does **not** apply to ordinary Turn Priority card resolution — nothing can interleave between an ability being announced and it resolving there, so there's nothing to snapshot against; selection and execution are the same instant.
+This does **not** apply to ordinary Main Phase card resolution — nothing can interleave between an ability being announced and it resolving there, so there's nothing to defer either way; selection and execution are the same instant regardless of which kind of targeting it uses.
 
 QueuedAbility {
 
   sourceAbilityId, controllerId
 
-  lockedTargets: ObjectRef\[\]                  // specific objects, chosen/evaluated at queue-time
+  targeting:
 
-  originalSelectionCriteria                   // used only for the re-legality check, never re-selection
+    | { kind: "locked", targets: ObjectRef\[\], originalSelectionCriteria }   // player choice, made at queue time
+
+    | { kind: "liveScope", spec: TargetSpec }                                // automatic scope, re-evaluated at resolution
+
+    | { kind: "none" }
 
 }
 
-**Generalized decision-checkpoint mechanism**: simultaneous-trigger ordering, and resolution-time player choices ("choose one," "choose any number," "look at 3, keep 1") are the same underlying mechanism — any point in resolution requiring player input pauses the engine, emits a decision request, and resumes only once the player responds. One codepath, not a special case per situation.
+**Traps never make choices at resolution.** If a trap's ability requires a player choice, that choice happens when the trap is *set* (i.e., at its queue time) and becomes a `locked` targeting, same as any other queued ability — there's nothing left to decide once the trap comes up in the LIFO stack. What a trap's resolution *can* still hit a decision point over is a side effect it causes: e.g. a trap destroys a unit that has "Fall: put a `+1/+1` counter on an allied unit here" — that Fall ability is a separate trigger, with its own player choice, made at *its own* queue time, which happens to fall in the middle of the trap resolving that caused it. The turn machine's contract handles this by design: a trap's resolution halting on such a side-trigger's decision is treated identically to the trap needing the decision itself (see `TurnMachineHooks.resolveTrapEffect` in the engine) — trap resolution stays paused, doesn't advance to Damage, and doesn't lose its place on the stack, regardless of whose choice it's actually waiting on.
+
+**Generalized decision-checkpoint mechanism**: simultaneous-trigger ordering, and resolution-time player choices ("choose one," "choose any number," "look at 3, keep 1") are the same underlying mechanism — any point in resolution requiring player input pauses the engine, emits a decision request, and resumes only once the player responds. One codepath, not a special case per situation. Not yet built (§9/§10) — but per the trap example above, resolution needs to support pausing *inside* something else's resolution, not just at the top level between queue items.
 
 ## 8\. Combat Damage Algorithm
 
@@ -445,18 +481,20 @@ The intent behind "live query, not a snapshot" was to let excess attackers find 
 
 ## 9\. Open Items / Deferred
 
-- **Shield vs. plating precedence**: when a unit has both a shield counter and a plating counter, the engine currently checks shield first (a full-block hit consumes only the shield; plating is untouched that hit) — this wasn't specified anywhere and was a judgment call made during implementation. Flagging for confirmation; easy to flip if wrong.
-- **Unlock mechanic** deferred entirely — not in the active vocabulary, revisit only on demand.  
-- **"Faceless Giga Armor"** has no colors/manacost/cmc at all in the source data — still unconfirmed whether this is an intentionally free/fusion-only card or missing data. Doesn't block engine work since the engine handles both interpretations identically (a mode with a zero/absent cost); worth a final check against the source before it's imported for real.  
-- Two straight-vs-curly-apostrophe mismatches in the source XML (Archangel's Brilliance/Sekka's Light, Dajani's Dridemate/Power Word Shield) are handled by name normalization at import time; fixing the source file directly would still be worthwhile at some point.
+- **Compound usage limits** (`UsageLimit`'s `{ compound: UsageLimit[] }` variant) has no defined composition semantics yet — twice-per-game as two `oncePerGame` entries? "Once per turn *and* once per game" combined? The engine currently treats it as always-available (permissive) rather than guessing a possibly-wrong restrictive interpretation. Define this the moment a real card needs it.
+- **`search` only searches the ability's own controller's zone.** Every confirmed example is self-targeted ("search YOUR deck for..."); there's no way yet to express "look at target opponent's deck" if a future card needs it.
+- **`modifyCost`** isn't implemented — waiting on real card examples (offered, not yet received) to know what "scope"/"condition" actually need to express.
 
 ## 10\. Roadmap Recap
 
 1. **Done**: engine scaffolding — types, phase machine, combat resolution (§5–8, implemented and tested against the worked traces above).  
-2. **In progress** — ability/effect resolution system: `dealDamage`, `heal`, `freeze`, `buffStat`, `addCounter`/`removeCounter`, `destroy`/`sacrifice`, and `draw` are implemented (including shield/plating mitigation on both combat and non-combat damage); the rest of the `Action` primitive list (§4 table) is still explicit-but-unimplemented. The decision-checkpoint mechanism itself (§7) — pausing resolution for a player choice — is not yet built, though the trap-resolution pipeline is now structured so that when it *is* built, a trap needing a decision correctly blocks progress into Damage rather than being skipped or run out of order. Card loading from data, the local play loop, and a minimal UI are still ahead.  
-3. Deck builder, accounts, persistence.  
-4. Server-authoritative multiplayer — same engine, hosted remotely, WebSocket transport.  
-5. Monetization/acquisition limits, if ever.
+2. **In progress** — ability/effect resolution system: `dealDamage`, `heal`, `freeze`, `buffStat`, `addCounter`/`removeCounter`, `destroy`/`sacrifice`, `draw`, `discard` (targeted only), `returnToHand`, `exile`, `changeCardType`, `massIncrement`, `gainEnergy`, `gainInfluence` (except the `"choice"` color), `spendInfluence`, `moveUnit`, `moveZone`, and `search` (deck/hand/graveyard/exile, both destination kinds) are implemented — including shield/plating mitigation on both combat and non-combat damage, and lane adjacency that correctly accounts for deactivated lanes. Still explicit-but-unimplemented: `negate` and usage limits are built at the type/data/pure-checking-logic level (see the Negate and Usage limits sections above) but not wired to a live consumer — see item 2a below. `copy`/`fuse`/`switchForm`/`createToken`/`transform` need card loading (item 3). `modifyCost` needs real examples (§9). `chooseOne`/`chooseAnyNumber`/`lookAtTopN` wait on the decision-checkpoint mechanism, described next.  
+2a. **Trigger-dispatch loop** — newly identified as its own piece of work, not yet started: nothing in the engine currently watches match state for `SoT`/`EtB`/`Fall`/`EoT`/etc. and automatically fires matching abilities; every ability execution so far has been invoked directly (by a test, or eventually by explicit game-loop code), never dispatched automatically. This is the prerequisite for `negate` and usage limits to matter at all (their checking logic exists and is tested, but nothing calls it), and for keywords like Poisonous/Lifelink/Deathtouch/MoraleBreaker to actually do anything beyond being recognized types.  
+2b. **Decision-checkpoint mechanism** (§7) — pausing resolution for a player choice — still not built. The trap-resolution pipeline is structured so that when it *is* built, a trap needing a decision correctly blocks progress into Damage rather than being skipped or run out of order; `search`'s multi-match/multi-mode cases and `moveZone`'s "which of several qualifying lanes" case (when driven by a scope rather than a concrete destination) are written to flag rather than guess, ready to hook into this once it exists.  
+3. Card loading from data, the local play loop, and a minimal UI.  
+4. Deck builder, accounts, persistence.  
+5. Server-authoritative multiplayer — same engine, hosted remotely, WebSocket transport.  
+6. Monetization/acquisition limits, if ever.
 
 **Tooling** (added alongside the above, not blocking it): ESLint + Prettier + a CI workflow now run on every change — see the Decision Log below for why.
 
@@ -479,3 +517,26 @@ This section exists because this spec previously went stale relative to real con
 - Trap-resolution phase ordering fixed: the engine now enters the `TrapResolution` phase *before* resolving traps, not after (previously the event log briefly misattributed trap-resolution events to `TrapPlacement`).
 - Trap resolution restructured to halt correctly (stay in `TrapResolution`, never advance to `Damage`) if a future trap effect needs player input mid-resolution, rather than assuming every trap resolves synchronously in one pass.
 - Added ESLint, Prettier, and a GitHub Actions CI workflow (lint + format check + typecheck + tests on every change) — process tooling, not a game-rules decision, but recorded here since it's the kind of thing a future handoff should know is now expected to pass.
+
+**2026-08-30** — Second batch, addressing follow-ups from the first review:
+- Shield-vs-plating precedence (§9's open item) confirmed correct as implemented — shield checked first. Item resolved, removed from §9.
+- §7 corrected: only *player-chosen* targets are locked at queue time; *automatic scopes* ("each enemy unit here") are evaluated fresh, live, at resolution instead — the previous wording had both locked uniformly, which was wrong. `QueuedAbility.targeting` in the engine now distinguishes `locked` from `liveScope`; `abilityQueue.ts` and its tests were rewritten to match.
+- Clarified that traps never make choices at resolution — a trap's own choice, if any, is locked at set/queue time. What CAN still require a decision mid-trap-resolution is a side effect the trap causes (e.g. destroying a unit with a Fall trigger that has its own player choice) — the turn machine's halt-and-hold-your-place contract already covers this correctly regardless of whose choice it's waiting on; see §7.
+- "Turn Priority" fully renamed to **Main Phase** throughout this document, matching the code (which had already made this rename). If you see "Turn Priority" anywhere else, treat it as a synonym for Main Phase from an earlier naming pass.
+
+**2026-08-31** — Implemented 8 more `Action` primitives (`discard`, `returnToHand`, `exile`, `changeCardType`, `massIncrement`, `gainEnergy`, `gainInfluence`, `spendInfluence`) and found real design gaps in the process, worth recording so they don't need re-deriving later:
+- `exile` has nowhere to actually put an exiled card — PlayerState (§5) only tracks deck/hand/graveyard, no exile zone. Implemented as "removed from the battlefield, tracked nowhere" (matches most removal effects' intent) but genuinely unreachable afterward — nothing can return it, count it, or reference "cards in exile." Needs a real tracked zone added to §5 the moment any card actually cares about interacting with exile as a zone.
+- `moveUnit`'s `toLane: LaneScope` can't resolve to a single deterministic destination on a 4-lane wraparound board — `adjacentLanes` alone gives 2 candidates, `otherLanes` gives 3, `allLanes` gives 4. Every real use of this primitive needs a "choose destination lane" decision, which is a different kind of choice than §7's object-targeting mechanism and doesn't exist yet. Left unimplemented rather than guessing a destination (e.g. "always pick the first candidate"). **Superseded, see 2026-09-02 below** — this was a misunderstanding of how repositioning actually works; it's player-driven with a concrete destination by the time the action executes, not a scope the engine needs to resolve.
+- `negate` was skipped because nothing in the engine yet automatically fires SoT/EtB/Fall/etc. triggers at all — there's no trigger-dispatch loop watching state changes and executing matching abilities; everything currently runs by a caller manually invoking `queueAbility`/`executeAction`. Storing a "this ability is negated" status effect would have nothing to ever consult it. Worth flagging as a prerequisite this uncovered: the trigger-dispatch loop itself isn't scoped as its own roadmap item yet, and probably should be before too much more of the Action list gets built on the assumption it exists. **Partially superseded, see 2026-09-02 below** — the trigger-dispatch gap is now a roadmap item (§10, 2a); Negate's own data model and checking logic are now built and tested, just still not wired to that loop, which is unchanged from before.
+- `changeCardType`'s type tracking follows the same "derive, don't store" pattern as power/toughness (§5's `BattlefieldUnit` doc comment) — a new `typeOverride` status effect, not a stored `currentTypes` field. Its only real consumer right now is its own attackSequence/structures membership update; nothing else in the engine checks an object's type yet (`targeting.ts` has no type filter).
+- `massIncrement` only bumps counters a target already has — it never creates one from nothing, matching "increasing all of the beneficial counters ON IT."
+
+**2026-09-02** — Implemented `exile` as a real zone, `search`, lane adjacency (with deactivation), and generalized `moveZone`; scaffolded (but did not wire up) `negate` and usage limits, per a detailed round of clarifications:
+- `exile` moved from "removed from the battlefield, tracked nowhere" to a genuine fourth zone on `PlayerState` (alongside deck/hand/graveyard) — cards will need to interact with it later (return-from-exile effects, "count cards in exile" effects), so it has to be queryable like any other zone, not a black hole. §5 updated.
+- `search` implemented: criteria are `type` and/or `cost` (`eq`/`gt`/`lt`), ANDed when both present, checked against **both** of a card's modes independently. Going to hand moves the whole card, mode uncommitted; going to the battlefield commits to whichever specific mode actually matched. Defaults to the ability's own controller's zone (§9: no opponent-zone search yet).
+- Lane adjacency reworked to account for deactivated lanes: a deactivated lane is skipped over in the ring, its former neighbors become adjacent to each other, and a unit sitting in a deactivated lane still resolves its own effective neighbors for repositioning purposes. Verified against every worked example given, including the two-deactivated-lanes case. New `resolution/lanes.ts`; `targeting.ts`'s older, simpler (deactivation-unaware) version was replaced with this one so the two don't disagree.
+- `moveUnit` corrected: takes a concrete destination lane (`toLaneId`), not a `LaneScope` to resolve — repositioning is player-driven with a concrete choice by the time the action executes; the engine offers legal destinations (via the adjacency above) rather than needing to pick among a scope itself. §4/§9 updated to remove the earlier (mistaken) blocker.
+- `moveZone` generalized into the one mechanism underlying `discard`/`exile`/`returnToHand` (which now delegate to it rather than duplicating battlefield-entry/exit logic) and, eventually, "play a card" and search's battlefield destination. §4 updated with the worked-out shape.
+- `negate` and usage limits (`UsageLimit`, generalized off `Activated` onto `Ability` itself, since a plain triggered ability needing "once per game" is a real, confirmed case) are now real, tested types and pure checking logic (`resolution/abilityAvailability.ts`) — including the specifically-confirmed requirement that two different abilities on the same object track independently. Neither is wired to a live consumer, because nothing in the engine yet automatically fires triggered abilities at all — that gap is now its own roadmap item (§10, 2a) rather than an implicit assumption.
+- `modifyCost` still waiting on real card examples (offered).
+- §9 cleared of the three long-standing cards.xml data-quality notes (Faceless Giga Armor's cost, the two apostrophe mismatches) — source-data typos, not engine concerns, per the game designer.

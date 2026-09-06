@@ -34,6 +34,14 @@ export interface PlayerState {
     deck: string[];
     hand: string[];
     graveyard: string[];
+    /** A real, queryable zone like the other three — NOT "removed from the game
+     *  untracked." Some exile effects do leave a card practically unreachable, but
+     *  others explicitly interact with it later ("...and return it at end of
+     *  turn") or reference it in bulk ("this card's power equals the number of
+     *  allied cards in exile") — both need exile to be a normal, inspectable zone.
+     *  Whether a *specific* exile effect is actually reachable again is down to
+     *  that card's own text, not a limitation of this zone. */
+    exile: string[];
   };
 }
 
@@ -46,7 +54,35 @@ export type StatusEffect =
    *  counters (which move power and toughness together by the same amount); buffStat
    *  allows independent, possibly asymmetric deltas (e.g. +2/+0), so it needed its
    *  own representation rather than being sugar over the counter system. */
-  | { kind: "statModifier"; power?: number; toughness?: number; expiresAt: import("./cards.js").Duration };
+  | { kind: "statModifier"; power?: number; toughness?: number; expiresAt: import("./cards.js").Duration }
+  /**
+   * Backs `changeCardType` (spec §4). Mirrors `statModifier`'s pattern — an
+   * overlay atop a derived base, never a stored replacement — for the same
+   * "avoid a second source of truth" reason BattlefieldUnit's doc comment gives
+   * for power/toughness: there's deliberately no stored `currentTypes` field.
+   * `from`/`to` match the action's own rule: effective types = (prior effective
+   * types − `from`) ∪ `to`. Multiple overlays apply in the order they were
+   * added — see actions.ts's `computeCurrentTypes`. `changeCardType` has no
+   * `duration` field in the Action type (unlike buffStat/freeze), so this is
+   * always `{ kind: "permanent" }` in practice today; the field still exists on
+   * this StatusEffect for symmetry with the others and in case that changes.
+   */
+  | {
+      kind: "typeOverride";
+      from: import("./cards.js").CardType[];
+      to: import("./cards.js").CardType[];
+      expiresAt: import("./cards.js").Duration;
+    }
+  /**
+   * Backs `negate` (spec §4) for its two PER-OBJECT scopes. `thisAbilityOnly`
+   * needs `abilityId` to know which of the object's (possibly several)
+   * abilities is silenced — see Ability.id. `allAbilitiesOfObject` needs no id;
+   * it silences everything on the object regardless. The third `negate` scope,
+   * `allCardsMatchingName`, is deliberately NOT a StatusEffect at all — see
+   * MatchState.activeNameNegations below for why.
+   */
+  | { kind: "negated"; scope: "thisAbilityOnly"; abilityId: string; expiresAt: import("./cards.js").Duration }
+  | { kind: "negated"; scope: "allAbilitiesOfObject"; expiresAt: import("./cards.js").Duration };
 
 export type InstanceOrigin =
   | { kind: "card"; cardDefId: string }
@@ -80,6 +116,13 @@ export interface CardInstance {
    *  `token`/`fusion` origins to match their definition's tag — a fused object
    *  "loses access to any modes on the components," so this becomes permanent once set. */
   activeMode: "A" | "B";
+  /** Usage-limit tracking for abilities with a `usageLimit` (spec §4/§9) — keyed
+   *  by Ability.id. Lives here, not on the (static, shared) Ability/ModeDefinition
+   *  data, because each physical copy needs its own independent count, and
+   *  because it needs to survive zone changes for oncePerGame limits, the same
+   *  way counters do (see the zone-change rule above). `lastTurnNumber` is only
+   *  meaningful for oncePerTurn-style limits — see resolution/abilityAvailability.ts. */
+  abilityUsage?: Record<string, { count: number; lastTurnNumber?: number }>;
 }
 
 /**
@@ -162,4 +205,12 @@ export interface MatchState {
   cardInstances: Record<string, CardInstance>;
   /** Keyed by instanceId. */
   units: Record<string, BattlefieldUnit>;
+  /** Backs `negate`'s `allCardsMatchingName` scope specifically — see the
+   *  `negated` StatusEffect's doc comment above for why the other two scopes
+   *  live per-object instead. Global (not per-unit) because this has to apply to
+   *  any object with a matching name for its duration, including ones that don't
+   *  exist yet when it resolves (a copy drawn later, a token created after the
+   *  fact, etc.) — a per-object StatusEffect literally cannot reach an object
+   *  that isn't on the battlefield yet, so this can't be modeled that way. */
+  activeNameNegations: { cardName: string; expiresAt: import("./cards.js").Duration }[];
 }
