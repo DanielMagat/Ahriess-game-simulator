@@ -5,6 +5,7 @@
 
 import type { MatchState } from "../types/state.js";
 import type { Allegiance, LaneScope, SequencePosition, TargetSpec, ObjectRef } from "../types/abilities.js";
+import { getEffectiveAdjacentLanes } from "./lanes.js";
 
 export interface EffectContext {
   /** Who controls/owns the effect being resolved — the reference point for "allied"/"enemy". */
@@ -43,14 +44,12 @@ function laneIdsInScope(
   const idx = allLaneIds.indexOf(sourceLaneId);
   if (idx === -1) return allLaneIds;
   switch (laneScope) {
-    case "adjacentLanes": {
-      // Wraparound: leftmost and rightmost lanes are adjacent — see spec §8's combat
-      // note on the same convention (this is the same board, same adjacency rule).
-      const n = allLaneIds.length;
-      const left = allLaneIds[(idx - 1 + n) % n];
-      const right = allLaneIds[(idx + 1) % n];
-      return Array.from(new Set([left, right]));
-    }
+    case "adjacentLanes":
+      // Deactivation-aware — see lanes.ts. A gap in the ring is skipped over,
+      // not treated as a dead end, so this stays correct as lanes deactivate
+      // over the course of a match rather than just reflecting the initial
+      // static board layout.
+      return getEffectiveAdjacentLanes(state.lanes, sourceLaneId);
     case "otherLanes":
       return allLaneIds.filter((id) => id !== sourceLaneId);
     case "allLanes":

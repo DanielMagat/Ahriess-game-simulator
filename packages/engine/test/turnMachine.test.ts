@@ -35,6 +35,7 @@ describe("turnMachine — full turn cycle", () => {
     const hooks: TurnMachineHooks = {
       resolveTrapEffect(trap, laneId, instanceId) {
         trapResolveOrder.push(instanceId);
+        return { status: "resolved" };
       },
       getLaneCombatSetup(laneId) {
         if (laneId === "lane1") {
@@ -143,6 +144,70 @@ describe("turnMachine — full turn cycle", () => {
     expect(state.attackTokenHolderId).toBe(P2);
     expect(state.attackTokenSpentThisTurn).toBe(false);
     expect(state.pendingInfluenceChoices).toEqual({});
+  });
+
+  it("Repositioning: isLegalRepositionDestination hook, when provided, rejects an illegal move and doesn't spend a charge", () => {
+    const P1 = "P1";
+    const P2 = "P2";
+    let state = createTurnMachine({
+      turnNumber: 2,
+      activePlayerId: P1,
+      attackTokenHolderId: P1,
+      otherPlayerId: P2,
+      laneIds: ["lane1", "lane2", "lane3"],
+    });
+
+    const hooks: TurnMachineHooks = {
+      getLaneCombatSetup: () => ({ sideA: [], sideB: [], hooks: noopLaneHooks() }),
+      // Simulates a real integration backed by lanes.ts's getEffectiveAdjacentLanes:
+      // pretend the unit is in lane1, where lane3 is NOT adjacent.
+      isLegalRepositionDestination: (instanceId, toLaneId) => toLaneId === "lane2",
+    };
+
+    let result = submitAction(state, P1, { kind: "chooseInfluence", color: "E" }, hooks);
+    state = result.state;
+    result = submitAction(state, P2, { kind: "chooseInfluence", color: "S" }, hooks);
+    state = result.state;
+    result = submitAction(state, P1, { kind: "initiateCombat" }, hooks);
+    state = result.state;
+    expect(state.repositioningCharges.P1).toBe(2); // equal to turnNumber
+
+    result = submitAction(state, P1, { kind: "moveUnit", instanceId: "X", toLaneId: "lane3" }, hooks);
+    expect(result.events).toContainEqual({
+      type: "actionRejected",
+      playerId: P1,
+      reason: "not a legal reposition destination",
+    });
+    expect(result.state.repositioningCharges.P1).toBe(2); // unchanged — nothing was spent
+    expect(result.state.priorityWindow.priorityPlayerId).toBe(P1); // still P1's turn to act
+
+    // The legal destination goes through normally.
+    result = submitAction(result.state, P1, { kind: "moveUnit", instanceId: "X", toLaneId: "lane2" }, hooks);
+    expect(result.state.repositioningCharges.P1).toBe(1);
+  });
+
+  it("Repositioning: with no isLegalRepositionDestination hook provided, any toLaneId is accepted (unit-testing the phase machine in isolation)", () => {
+    const P1 = "P1";
+    const P2 = "P2";
+    let state = createTurnMachine({
+      turnNumber: 1,
+      activePlayerId: P1,
+      attackTokenHolderId: P1,
+      otherPlayerId: P2,
+      laneIds: ["lane1", "lane2"],
+    });
+    const hooks: TurnMachineHooks = { getLaneCombatSetup: () => ({ sideA: [], sideB: [], hooks: noopLaneHooks() }) };
+
+    let result = submitAction(state, P1, { kind: "chooseInfluence", color: "E" }, hooks);
+    state = result.state;
+    result = submitAction(state, P2, { kind: "chooseInfluence", color: "S" }, hooks);
+    state = result.state;
+    result = submitAction(state, P1, { kind: "initiateCombat" }, hooks);
+    state = result.state;
+
+    result = submitAction(state, P1, { kind: "moveUnit", instanceId: "X", toLaneId: "anywhere-at-all" }, hooks);
+    expect(result.events.some((e) => e.type === "actionRejected")).toBe(false);
+    expect(result.state.repositioningCharges.P1).toBe(0); // turnNumber 1 - the 1 charge just spent
   });
 
   it("rejects actions from a player who doesn't currently hold priority (during a priority-gated phase)", () => {
