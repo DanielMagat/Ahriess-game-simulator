@@ -1,6 +1,6 @@
 // Generic "alternating priority window" — see GAME_ENGINE_SPEC.md §6.
 //
-// Turn Priority, Repositioning, and Trap Placement are all structurally the same
+// Main Phase, Repositioning, and Trap Placement are all structurally the same
 // procedure: players alternate taking an action or passing, starting with a given
 // player, until both players pass consecutively — they differ only in *which*
 // actions are legal and what a pass costs. This is implemented once and parameterized.
@@ -14,7 +14,7 @@ export interface PriorityWindowState {
 
 export interface PriorityWindowRules<TAction> {
   /** Whether the given player is currently allowed to pass. The attack-token holder,
-   *  for instance, cannot pass in Turn Priority until the token is spent. */
+   *  for instance, cannot pass in Main Phase until the token is spent. */
   canPass(playerId: PlayerId): boolean;
   /** Whether a given action is legal for the given player right now. */
   isLegalAction(playerId: PlayerId, action: TAction): boolean;

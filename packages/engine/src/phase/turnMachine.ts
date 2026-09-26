@@ -112,17 +112,30 @@ export interface TurnMachineHooks {
    * Actually resolving a trap's effect — stubbed until the ability engine exists.
    * Called once per trap, in LIFO order, across the whole board (not per lane).
    *
-   * Returns `{ status: "needsDecision" }` if resolving this trap requires player
-   * input the ability engine can't supply synchronously (e.g. a "choose one" mid-
-   * effect) — see spec §7's decision-checkpoint mechanism. When that happens, the
-   * turn machine halts trap resolution entirely: it stays in TrapResolution, does
-   * NOT pop this trap off the stack (so nothing is skipped or double-applied), and
-   * does NOT advance to Damage. Resuming from that blocked state — supplying the
-   * decision and re-invoking resolution from where it left off — is the decision-
-   * checkpoint mechanism's job once it exists; this hook's contract just needs to
-   * support it correctly rather than assume every trap resolves synchronously.
+   * A trap's OWN choices are never made here — per spec §7, if a trap's ability
+   * needs a player choice, that choice is made when the trap is SET (queue time),
+   * producing a `locked` QueuedAbility; there's nothing left to decide by the time
+   * this hook runs. `needsDecision` exists for a different, very real case: this
+   * trap's (already fully-determined) effect can itself cause something else to
+   * trigger — e.g. destroying a unit that has "Fall: put a +1/+1 counter on an
+   * allied unit here," which is its own ability with its own player choice, fired
+   * as a side effect of resolving THIS trap, not the trap's own targeting.
+   *
+   * When that happens, this hook returns `{ status: "needsDecision" }` and the turn
+   * machine halts trap resolution entirely: it stays in TrapResolution, does NOT
+   * pop this trap off the stack (so nothing is skipped or double-applied), and does
+   * NOT advance to Damage. The harder part is on this hook's future implementation,
+   * not the turn machine: resuming correctly means finishing the interrupted
+   * trigger (queueing/resolving Fall with whatever the player picked) WITHOUT
+   * re-running the part of this trap's own effect that already completed (the
+   * destroy already happened — it can't happen again on resume). That resumable-
+   * partial-execution behavior is the decision-checkpoint mechanism's job once it
+   * exists (spec §7); this hook's contract just needs to support being re-invoked
+   * for the same still-on-the-stack trap correctly, not assume every trap resolves
+   * in one uninterrupted synchronous pass.
    * Omit the hook (or always return "resolved") for now — it's what every current
-   * test does, since no trap effect exists yet that actually asks for input.
+   * test does, since no trap effect exists yet that actually triggers something
+   * needing a decision.
    */
   resolveTrapEffect?(trap: QueuedAbility, laneId: string, instanceId: string): TrapResolutionOutcome;
   /** Supplies this lane's two sides for Damage phase resolution, and the callbacks
@@ -134,6 +147,17 @@ export interface TurnMachineHooks {
   };
   /** Agile N and similar keywords will eventually modify this — defaults to 1. */
   chargeCostForMove?(instanceId: string, toLaneId: string): number;
+  /**
+   * Whether moving this unit to this specific lane is currently legal — in
+   * practice, whether `toLaneId` is in `getEffectiveAdjacentLanes(lanes,
+   * currentLaneOf(instanceId))` (resolution/lanes.ts), which accounts for
+   * deactivated lanes being skipped over. Omitted (like every other hook here)
+   * means no check is performed — safe for unit-testing the phase machine in
+   * isolation, but real integration should always provide this once MatchState
+   * is wired in; without it, `submitRepositioningAction` would accept any
+   * `toLaneId` at all, adjacent or not.
+   */
+  isLegalRepositionDestination?(instanceId: string, toLaneId: string): boolean;
 }
 
 export function createTurnMachine(params: {
@@ -395,6 +419,10 @@ function submitRepositioningAction(
   }
 
   // moveUnit
+  if (hooks.isLegalRepositionDestination && !hooks.isLegalRepositionDestination(action.instanceId, action.toLaneId)) {
+    events.push({ type: "actionRejected", playerId, reason: "not a legal reposition destination" });
+    return { state, events };
+  }
   const cost = hooks.chargeCostForMove?.(action.instanceId, action.toLaneId) ?? 1;
   const available = state.repositioningCharges[playerId] ?? 0;
   if (available < cost) {
@@ -465,10 +493,9 @@ function submitTrapPlacementAction(
         // this instance's definition — see TurnMachineHooks.resolveTrapEffect.
         sourceAbilityId: action.instanceId,
         controllerId: playerId,
-        lockedTargets: [], // real target-snapshotting is part of the ability engine, next slice
-        originalSelectionCriteria: {},
+        targeting: { kind: "none" }, // real target-snapshotting is part of the ability engine, next slice
         action: { hook: "unresolved" }, // effect execution is part of the ability engine, next slice
-      } as QueuedAbility,
+      },
     },
   ];
   events.push({ type: "trapSet", playerId, instanceId: action.instanceId, laneId: action.laneId });
